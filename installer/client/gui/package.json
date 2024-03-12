@@ -4,7 +4,8 @@
   "description": "a fabric electron app",
   "main": "main.js",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "start:gui": "cd installer/client/gui && npm start"
   },
   "author": "",
   "license": "ISC",
