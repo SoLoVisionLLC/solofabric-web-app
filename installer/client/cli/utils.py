@@ -1,14 +1,14 @@
 import requests
 import os
 from openai import OpenAI
+import asyncio
 import pyperclip
 import sys
 import platform
 from dotenv import load_dotenv
-from requests.exceptions import HTTPError
-from tqdm import tqdm
 import zipfile
 import tempfile
+import re
 import shutil
 
 current_directory = os.path.dirname(os.path.realpath(__file__))
@@ -40,16 +40,56 @@ class Standalone:
             apikey = os.environ["OPENAI_API_KEY"]
             self.client = OpenAI()
             self.client.api_key = apikey
-        except KeyError:
-            print("OPENAI_API_KEY not found in environment variables.")
-
-        except FileNotFoundError:
+        except:
             print("No API key found. Use the --apikey option to set the key")
-            sys.exit()
+        self.local = False
         self.config_pattern_directory = config_directory
         self.pattern = pattern
         self.args = args
         self.model = args.model
+        self.claude = False
+        sorted_gpt_models, ollamaList, claudeList = self.fetch_available_models()
+        self.local = self.model.strip() in ollamaList
+        self.claude = self.model.strip() in claudeList
+
+    async def localChat(self, messages):
+        from ollama import AsyncClient
+        response = await AsyncClient().chat(model=self.model, messages=messages)
+        print(response['message']['content'])
+
+    async def localStream(self, messages):
+        from ollama import AsyncClient
+        async for part in await AsyncClient().chat(model=self.model, messages=messages, stream=True):
+            print(part['message']['content'], end='', flush=True)
+
+    async def claudeStream(self, system, user):
+        from anthropic import AsyncAnthropic
+        self.claudeApiKey = os.environ["CLAUDE_API_KEY"]
+        Streamingclient = AsyncAnthropic(api_key=self.claudeApiKey)
+        async with Streamingclient.messages.stream(
+            max_tokens=4096,
+            system=system,
+            messages=[user],
+            model=self.model, temperature=0.0, top_p=1.0
+        ) as stream:
+            async for text in stream.text_stream:
+                print(text, end="", flush=True)
+            print()
+
+        message = await stream.get_final_message()
+
+    async def claudeChat(self, system, user):
+        from anthropic import Anthropic
+        self.claudeApiKey = os.environ["CLAUDE_API_KEY"]
+        client = Anthropic(api_key=self.claudeApiKey)
+        message = client.messages.create(
+            max_tokens=4096,
+            system=system,
+            messages=[user],
+            model=self.model,
+            temperature=0.0, top_p=1.0
+        )
+        print(message.content[0].text)
 
     def streamMessage(self, input_data: str, context=""):
         """        Stream a message and handle exceptions.
@@ -69,6 +109,7 @@ class Standalone:
         )
         user_message = {"role": "user", "content": f"{input_data}"}
         wisdom_File = os.path.join(current_directory, wisdomFilePath)
+        system = ""
         buffer = ""
         if self.pattern:
             try:
@@ -89,29 +130,45 @@ class Standalone:
             else:
                 messages = [user_message]
         try:
-            stream = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=0.0,
-                top_p=1,
-                frequency_penalty=0.1,
-                presence_penalty=0.1,
-                stream=True,
-            )
-            for chunk in stream:
-                if chunk.choices[0].delta.content is not None:
-                    char = chunk.choices[0].delta.content
-                    buffer += char
-                    if char not in ["\n", " "]:
-                        print(char, end="")
-                    elif char == " ":
-                        print(" ", end="")  # Explicitly handle spaces
-                    elif char == "\n":
-                        print()  # Handle newlines
-                sys.stdout.flush()
+            if self.local:
+                asyncio.run(self.localStream(messages))
+            elif self.claude:
+                from anthropic import AsyncAnthropic
+                asyncio.run(self.claudeStream(system, user_message))
+            else:
+                stream = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=0.0,
+                    top_p=1,
+                    frequency_penalty=0.1,
+                    presence_penalty=0.1,
+                    stream=True,
+                )
+                for chunk in stream:
+                    if chunk.choices[0].delta.content is not None:
+                        char = chunk.choices[0].delta.content
+                        buffer += char
+                        if char not in ["\n", " "]:
+                            print(char, end="")
+                        elif char == " ":
+                            print(" ", end="")  # Explicitly handle spaces
+                        elif char == "\n":
+                            print()  # Handle newlines
+                    sys.stdout.flush()
         except Exception as e:
-            print(f"Error: {e}")
-            print(e)
+            if "All connection attempts failed" in str(e):
+                print(
+                    "Error: cannot connect to llama2. If you have not already, please visit https://ollama.com for installation instructions")
+            if "CLAUDE_API_KEY" in str(e):
+                print(
+                    "Error: CLAUDE_API_KEY not found in environment variables. Please run --setup and add the key")
+            if "overloaded_error" in str(e):
+                print(
+                    "Error: Fabric is working fine, but claude is overloaded. Please try again later.")
+            else:
+                print(f"Error: {e}")
+                print(e)
         if self.args.copy:
             pyperclip.copy(buffer)
         if self.args.output:
@@ -136,6 +193,7 @@ class Standalone:
         )
         user_message = {"role": "user", "content": f"{input_data}"}
         wisdom_File = os.path.join(current_directory, wisdomFilePath)
+        system = ""
         if self.pattern:
             try:
                 with open(wisdom_File, "r") as f:
@@ -155,18 +213,35 @@ class Standalone:
             else:
                 messages = [user_message]
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=0.0,
-                top_p=1,
-                frequency_penalty=0.1,
-                presence_penalty=0.1,
-            )
-            print(response.choices[0].message.content)
+            if self.local:
+                asyncio.run(self.localChat(messages))
+            elif self.claude:
+                asyncio.run(self.claudeChat(system, user_message))
+            else:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=0.0,
+                    top_p=1,
+                    frequency_penalty=0.1,
+                    presence_penalty=0.1,
+                )
+                print(response.choices[0].message.content)
         except Exception as e:
-            print(f"Error: {e}")
-            print(e)
+            if "All connection attempts failed" in str(e):
+                print(
+                    "Error: cannot connect to llama2. If you have not already, please visit https://ollama.com for installation instructions")
+            if "CLAUDE_API_KEY" in str(e):
+                print(
+                    "Error: CLAUDE_API_KEY not found in environment variables. Please run --setup and add the key")
+            if "overloaded_error" in str(e):
+                print(
+                    "Error: Fabric is working fine, but claude is overloaded. Please try again later.")
+            if "Attempted to call a sync iterator on an async stream" in str(e):
+                print("Error: There is a problem connecting fabric with your local ollama installation. Please visit https://ollama.com for installation instructions. It is possible that you have chosen the wrong model. Please run fabric --listmodels to see the available models and choose the right one with fabric --model <model> or fabric --changeDefaultModel. If this does not work. Restart your computer (always a good idea) and try again. If you are still having problems, please visit https://ollama.com for installation instructions.")
+            else:
+                print(f"Error: {e}")
+                print(e)
         if self.args.copy:
             pyperclip.copy(response.choices[0].message.content)
         if self.args.output:
@@ -174,25 +249,40 @@ class Standalone:
                 f.write(response.choices[0].message.content)
 
     def fetch_available_models(self):
-        headers = {
-            "Authorization": f"Bearer {self.client.api_key}"
-        }
+        gptlist = []
+        fullOllamaList = []
+        claudeList = ['claude-3-opus-20240229']
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.client.api_key}"
+            }
+            response = requests.get(
+                "https://api.openai.com/v1/models", headers=headers)
 
-        response = requests.get(
-            "https://api.openai.com/v1/models", headers=headers)
+            if response.status_code == 200:
+                models = response.json().get("data", [])
+                # Filter only gpt models
+                gpt_models = [model for model in models if model.get(
+                    "id", "").startswith(("gpt"))]
+                # Sort the models alphabetically by their ID
+                sorted_gpt_models = sorted(
+                    gpt_models, key=lambda x: x.get("id"))
 
-        if response.status_code == 200:
-            models = response.json().get("data", [])
-            # Filter only gpt models
-            gpt_models = [model for model in models if model.get(
-                "id", "").startswith(("gpt"))]
-            # Sort the models alphabetically by their ID
-            sorted_gpt_models = sorted(gpt_models, key=lambda x: x.get("id"))
-
-            for model in sorted_gpt_models:
-                print(model.get("id"))
-        else:
-            print(f"Failed to fetch models: HTTP {response.status_code}")
+                for model in sorted_gpt_models:
+                    gptlist.append(model.get("id"))
+            else:
+                print(f"Failed to fetch models: HTTP {response.status_code}")
+                sys.exit()
+        except:
+            print('No OpenAI API key found. Please run fabric --setup and add the key if you wish to interact with openai')
+        import ollama
+        try:
+            default_modelollamaList = ollama.list()['models']
+            for model in default_modelollamaList:
+                fullOllamaList.append(model['name'].split(":")[0])
+        except:
+            fullOllamaList = []
+        return gptlist, fullOllamaList, claudeList
 
     def get_cli_input(self):
         """ aided by ChatGPT; uses platform library
@@ -265,13 +355,9 @@ class Alias:
         self.config_files = []
         home_directory = os.path.expanduser("~")
         self.patterns = os.path.join(home_directory, ".config/fabric/patterns")
-        if os.path.exists(os.path.join(home_directory, ".bashrc")):
-            self.config_files.append(os.path.join(home_directory, ".bashrc"))
-        if os.path.exists(os.path.join(home_directory, ".zshrc")):
-            self.config_files.append(os.path.join(home_directory, ".zshrc"))
-        if os.path.exists(os.path.join(home_directory, ".bash_profile")):
+        if os.path.exists(os.path.join(home_directory, ".config/fabric/fabric-bootstrap.inc")):
             self.config_files.append(os.path.join(
-                home_directory, ".bash_profile"))
+                home_directory, ".config/fabric/fabric-bootstrap.inc"))
         self.remove_all_patterns()
         self.add_patterns()
         print('Aliases added successfully. Please restart your terminal to use them.')
@@ -329,6 +415,51 @@ class Setup:
             self.config_directory, "patterns")
         os.makedirs(self.pattern_directory, exist_ok=True)
         self.env_file = os.path.join(self.config_directory, ".env")
+        self.gptlist = []
+        self.fullOllamaList = []
+        self.claudeList = ['claude-3-opus-20240229']
+        load_dotenv(self.env_file)
+        try:
+            openaiapikey = os.environ["OPENAI_API_KEY"]
+            self.openaiapi_key = openaiapikey
+        except:
+            pass
+        try:
+            self.fetch_available_models()
+        except:
+            pass
+
+    def fetch_available_models(self):
+        headers = {
+            "Authorization": f"Bearer {self.openaiapi_key}"
+        }
+
+        response = requests.get(
+            "https://api.openai.com/v1/models", headers=headers)
+
+        if response.status_code == 200:
+            models = response.json().get("data", [])
+            # Filter only gpt models
+            gpt_models = [model for model in models if model.get(
+                "id", "").startswith(("gpt"))]
+            # Sort the models alphabetically by their ID
+            sorted_gpt_models = sorted(
+                gpt_models, key=lambda x: x.get("id"))
+
+            for model in sorted_gpt_models:
+                self.gptlist.append(model.get("id"))
+        else:
+            print(f"Failed to fetch models: HTTP {response.status_code}")
+            sys.exit()
+        import ollama
+        try:
+            default_modelollamaList = ollama.list()['models']
+            for model in default_modelollamaList:
+                self.fullOllamaList.append(model['name'].rstrip(":latest"))
+        except:
+            self.fullOllamaList = []
+        allmodels = self.gptlist + self.fullOllamaList + self.claudeList
+        return allmodels
 
     def api_key(self, api_key):
         """        Set the OpenAI API key in the environment file.
@@ -342,11 +473,189 @@ class Setup:
         Raises:
             OSError: If the environment file does not exist or cannot be accessed.
         """
-
-        if not os.path.exists(self.env_file):
+        api_key = api_key.strip()
+        if not os.path.exists(self.env_file) and api_key:
             with open(self.env_file, "w") as f:
                 f.write(f"OPENAI_API_KEY={api_key}")
             print(f"OpenAI API key set to {api_key}")
+        elif api_key:
+            # erase the line OPENAI_API_KEY=key and write the new key
+            with open(self.env_file, "r") as f:
+                lines = f.readlines()
+            with open(self.env_file, "w") as f:
+                for line in lines:
+                    if "OPENAI_API_KEY" not in line:
+                        f.write(line)
+                f.write(f"OPENAI_API_KEY={api_key}")
+
+    def claude_key(self, claude_key):
+        """        Set the Claude API key in the environment file.
+
+        Args:
+            claude_key (str): The API key to be set.
+
+        Returns:
+            None
+
+        Raises:
+            OSError: If the environment file does not exist or cannot be accessed.
+        """
+        claude_key = claude_key.strip()
+        if os.path.exists(self.env_file) and claude_key:
+            with open(self.env_file, "r") as f:
+                lines = f.readlines()
+            with open(self.env_file, "w") as f:
+                for line in lines:
+                    if "CLAUDE_API_KEY" not in line:
+                        f.write(line)
+                f.write(f"CLAUDE_API_KEY={claude_key}")
+        elif claude_key:
+            with open(self.env_file, "w") as f:
+                f.write(f"CLAUDE_API_KEY={claude_key}")
+
+    def update_fabric_command(self, line, model):
+        fabric_command_regex = re.compile(
+            r"(alias.*fabric --pattern\s+\S+.*?)( --model.*)?'")
+        match = fabric_command_regex.search(line)
+        if match:
+            base_command = match.group(1)
+            # Provide a default value for current_flag
+            current_flag = match.group(2) if match.group(2) else ""
+            new_flag = ""
+            new_flag = f" --model {model}"
+            # Update the command if the new flag is different or to remove an existing flag.
+            # Ensure to add the closing quote that was part of the original regex
+            return f"{base_command}{new_flag}'\n"
+        else:
+            return line  # Return the line unmodified if no match is found.
+
+    def update_fabric_alias(self, line, model):
+        fabric_alias_regex = re.compile(
+            r"(alias fabric='[^']+?)( --model.*)?'")
+        match = fabric_alias_regex.search(line)
+        if match:
+            base_command, current_flag = match.groups()
+            new_flag = f" --model {model}"
+            # Update the alias if the new flag is different or to remove an existing flag.
+            return f"{base_command}{new_flag}'\n"
+        else:
+            return line  # Return the line unmodified if no match is found.
+
+    def clear_alias(self, line):
+        fabric_command_regex = re.compile(
+            r"(alias fabric='[^']+?)( --model.*)?'")
+        match = fabric_command_regex.search(line)
+        if match:
+            base_command = match.group(1)
+            return f"{base_command}'\n"
+        else:
+            return line  # Return the line unmodified if no match is found.
+
+    def clear_env_line(self, line):
+        fabric_command_regex = re.compile(
+            r"(alias.*fabric --pattern\s+\S+.*?)( --model.*)?'")
+        match = fabric_command_regex.search(line)
+        if match:
+            base_command = match.group(1)
+            return f"{base_command}'\n"
+        else:
+            return line  # Return the line unmodified if no match is found.
+
+    def pattern(self, line):
+        fabric_command_regex = re.compile(
+            r"(alias fabric='[^']+?)( --model.*)?'")
+        match = fabric_command_regex.search(line)
+        if match:
+            base_command = match.group(1)
+            return f"{base_command}'\n"
+        else:
+            return line  # Return the line unmodified if no match is found.
+
+    def clean_env(self):
+        """Clear the DEFAULT_MODEL from the environment file.
+
+        Returns:
+            None
+        """
+        user_home = os.path.expanduser("~")
+        sh_config = None
+        # Check for shell configuration files
+        if os.path.exists(os.path.join(user_home, ".config/fabric/fabric-bootstrap.inc")):
+            sh_config = os.path.join(
+                user_home, ".config/fabric/fabric-bootstrap.inc")
+        else:
+            print("No environment file found.")
+        if sh_config:
+            with open(sh_config, "r") as f:
+                lines = f.readlines()
+            with open(sh_config, "w") as f:
+                for line in lines:
+                    modified_line = line
+                    # Update existing fabric commands
+                    if "fabric --pattern" in line:
+                        modified_line = self.clear_env_line(
+                            modified_line)
+                    elif "fabric=" in line:
+                        modified_line = self.clear_alias(
+                            modified_line)
+                    f.write(modified_line)
+            self.remove_duplicates(env_file)
+        else:
+            print("No shell configuration file found.")
+
+    def default_model(self, model):
+        """Set the default model in the environment file.
+
+        Args:
+            model (str): The model to be set.
+        """
+        model = model.strip()
+        if model:
+            # Write or update the DEFAULT_MODEL in env_file
+            allModels = self.claudeList + self.fullOllamaList + self.gptlist
+            if model not in allModels:
+                print(
+                    f"Error: {model} is not a valid model. Please run fabric --listmodels to see the available models.")
+                sys.exit()
+
+        # Compile regular expressions outside of the loop for efficiency
+
+        user_home = os.path.expanduser("~")
+        sh_config = None
+        # Check for shell configuration files
+        if os.path.exists(os.path.join(user_home, ".config/fabric/fabric-bootstrap.inc")):
+            sh_config = os.path.join(
+                user_home, ".config/fabric/fabric-bootstrap.inc")
+
+        if sh_config:
+            with open(sh_config, "r") as f:
+                lines = f.readlines()
+            with open(sh_config, "w") as f:
+                for line in lines:
+                    modified_line = line
+                    # Update existing fabric commands
+                    if "fabric --pattern" in line:
+                        modified_line = self.update_fabric_command(
+                            modified_line, model)
+                    elif "fabric=" in line:
+                        modified_line = self.update_fabric_alias(
+                            modified_line, model)
+                    f.write(modified_line)
+            print(f"""Default model changed to {
+                  model}. Please restart your terminal to use it.""")
+        else:
+            print("No shell configuration file found.")
+
+    def remove_duplicates(self, filename):
+        unique_lines = set()
+        with open(filename, 'r') as file:
+            lines = file.readlines()
+
+        with open(filename, 'w') as file:
+            for line in lines:
+                if line not in unique_lines:
+                    file.write(line)
+                    unique_lines.add(line)
 
     def patterns(self):
         """        Method to update patterns and exit the system.
@@ -367,8 +676,12 @@ class Setup:
         """
 
         print("Welcome to Fabric. Let's get started.")
-        apikey = input("Please enter your OpenAI API key\n")
+        apikey = input(
+            "Please enter your OpenAI API key. If you do not have one or if you have already entered it, press enter.\n")
         self.api_key(apikey.strip())
+        print("Please enter your claude API key. If you do not have one, or if you have already entered it, press enter.\n")
+        claudekey = input()
+        self.claude_key(claudekey.strip())
         self.patterns()
 
 
